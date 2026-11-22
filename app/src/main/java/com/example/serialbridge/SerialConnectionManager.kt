@@ -13,8 +13,10 @@ import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.hardware.usb.UsbDevice
 import android.hardware.usb.UsbManager
+import android.net.Uri
 import android.os.Build
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
@@ -48,21 +50,30 @@ class SerialConnectionManager(
     private val context: Context,
     private val scope: CoroutineScope
 ) {
+    // Estados gerais
     var mode by mutableStateOf(ConnectionMode.USB)
     var isConnected by mutableStateOf(false)
     var statusText by mutableStateOf("Desconectado")
     var hasBtPermission by mutableStateOf(checkBtPermissions())
 
+    // Estados de Gravação (Firmware Flasher)
+    var selectedFlashTarget by mutableStateOf(FlashTarget.ARDUINO_115200)
+    var isFlashing by mutableStateOf(false)
+    var flashProgress by mutableFloatStateOf(0f)
+
+    // Estados Bluetooth
     private val btManager = context.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
     private val btAdapter = btManager.adapter
     var pairedDevices by mutableStateOf<List<BluetoothDevice>>(emptyList())
     var selectedBtDevice by mutableStateOf<BluetoothDevice?>(null)
     private var btSocket: BluetoothSocket? = null
 
+    // Estados Wi-Fi TCP
     var ipAddress by mutableStateOf("192.168.4.1")
     var portText by mutableStateOf("8080")
     private var tcpSocket: Socket? = null
 
+    // Estados USB OTG
     private val usbManager = context.getSystemService(Context.USB_SERVICE) as UsbManager
     var usbDrivers by mutableStateOf<List<UsbSerialDriver>>(emptyList())
     var selectedUsbDriver by mutableStateOf<UsbSerialDriver?>(null)
@@ -70,6 +81,7 @@ class SerialConnectionManager(
     var selectedBaudRate by mutableIntStateOf(115200)
     private var usbPort: UsbSerialPort? = null
 
+    // Streams, Jobs e Terminal
     private var outputStream: OutputStream? = null
     private var readerJob: Job? = null
     val logs = mutableStateListOf<String>()
@@ -143,6 +155,77 @@ class SerialConnectionManager(
         }
     }
 
+    fun flashFirmwareFromUri(uri: Uri) {
+        val port = usbPort
+        if (!isConnected || mode != ConnectionMode.USB || port == null) {
+            appendLog("ERR", "Conecte a placa via USB (OTG) antes de gravar o firmware.")
+            return
+        }
+        if (isFlashing) return
+
+        scope.launch(Dispatchers.IO) {
+            // Pausa a thread de leitura serial para assumir controle exclusivo do barramento USB
+            readerJob?.cancel()
+            readerJob?.join()
+
+            withContext(Dispatchers.Main) {
+                isFlashing = true
+                flashProgress = 0f
+                statusText = "Gravando Firmware..."
+            }
+
+            try {
+                val fileBytes = context.contentResolver.openInputStream(uri)?.use { it.readBytes() }
+                    ?: throw Exception("Não foi possível ler o arquivo selecionado")
+
+                val logCallback: (String) -> Unit = { msg ->
+                    scope.launch(Dispatchers.Main) { appendLog("FLASH", msg) }
+                }
+                val progressCallback: (Float) -> Unit = { p ->
+                    scope.launch(Dispatchers.Main) { flashProgress = p }
+                }
+
+                when (selectedFlashTarget) {
+                    FlashTarget.ARDUINO_115200 -> {
+                        FirmwareFlasher.flashArduinoHex(port, fileBytes, 115200, logCallback, progressCallback)
+                    }
+                    FlashTarget.ARDUINO_57600 -> {
+                        FirmwareFlasher.flashArduinoHex(port, fileBytes, 57600, logCallback, progressCallback)
+                    }
+                    FlashTarget.ESP32_APP -> {
+                        FirmwareFlasher.flashEsp32Bin(port, fileBytes, 0x10000, logCallback, progressCallback)
+                    }
+                    FlashTarget.ESP32_MERGED -> {
+                        FirmwareFlasher.flashEsp32Bin(port, fileBytes, 0x0, logCallback, progressCallback)
+                    }
+                }
+
+                // Restaura a taxa de comunicação do console serial após a gravação
+                port.setParameters(selectedBaudRate, 8, UsbSerialPort.STOPBITS_1, UsbSerialPort.PARITY_NONE)
+                withContext(Dispatchers.Main) {
+                    statusText = "USB: $selectedBaudRate bps"
+                }
+                startUsbReader(port)
+
+            } catch (e: Exception) {
+                withContext(Dispatchers.Main) {
+                    appendLog("ERR", "Falha na gravação: ${e.message}")
+                    statusText = "Erro na gravação"
+                }
+                try {
+                    port.setParameters(selectedBaudRate, 8, UsbSerialPort.STOPBITS_1, UsbSerialPort.PARITY_NONE)
+                    startUsbReader(port)
+                } catch (_: Exception) {
+                    withContext(Dispatchers.Main) { disconnect() }
+                }
+            } finally {
+                withContext(Dispatchers.Main) {
+                    isFlashing = false
+                }
+            }
+        }
+    }
+
     fun connect() {
         when (mode) {
             ConnectionMode.USB -> connectUsb()
@@ -164,11 +247,16 @@ class SerialConnectionManager(
         tcpSocket = null
         usbPort = null
         isConnected = false
+        isFlashing = false
         statusText = "Desconectado"
         appendLog("SYS", "Conexão encerrada")
     }
 
     fun sendCommand(cmd: String) {
+        if (isFlashing) {
+            appendLog("WARN", "Aguarde a gravação terminar")
+            return
+        }
         if (!isConnected) {
             appendLog("WARN", "Não conectado")
             return
@@ -348,7 +436,7 @@ class SerialConnectionManager(
                 }
             } catch (e: Exception) {
                 withContext(Dispatchers.Main) {
-                    if (isConnected) {
+                    if (isConnected && !isFlashing) {
                         appendLog("ERR", "Cabo USB desconectado: ${e.message}")
                         disconnect()
                     }

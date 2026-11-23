@@ -52,9 +52,18 @@ fun SerialBridgeScreen() {
 
     var usbDropdownExpanded by remember { mutableStateOf(false) }
     var baudDropdownExpanded by remember { mutableStateOf(false) }
+    var targetDropdownExpanded by remember { mutableStateOf(false) }
     var btDropdownExpanded by remember { mutableStateOf(false) }
     var commandInput by remember { mutableStateOf("") }
     var sliderValue by remember { mutableFloatStateOf(0f) }
+
+    val filePickerLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocument()
+    ) { uri ->
+        if (uri != null) {
+            manager.flashFirmwareFromUri(uri)
+        }
+    }
 
     val permissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
@@ -96,8 +105,9 @@ fun SerialBridgeScreen() {
         modifier = Modifier
             .fillMaxSize()
             .padding(14.dp),
-        verticalArrangement = Arrangement.spacedBy(10.dp)
+        verticalArrangement = Arrangement.spacedBy(8.dp)
     ) {
+        // Cabeçalho e Status
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.SpaceBetween,
@@ -105,7 +115,11 @@ fun SerialBridgeScreen() {
         ) {
             Text("SerialBridge", fontSize = 20.sp, fontWeight = FontWeight.Bold)
             Surface(
-                color = if (manager.isConnected) Color(0xFF1B5E20) else Color(0xFF424242),
+                color = when {
+                    manager.isFlashing -> Color(0xFFE65100)
+                    manager.isConnected -> Color(0xFF1B5E20)
+                    else -> Color(0xFF424242)
+                },
                 shape = RoundedCornerShape(12.dp)
             ) {
                 Text(
@@ -117,6 +131,7 @@ fun SerialBridgeScreen() {
             }
         }
 
+        // Seletor de Protocolo
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             FilterChip(
                 selected = manager.mode == ConnectionMode.USB,
@@ -140,83 +155,150 @@ fun SerialBridgeScreen() {
             )
         }
 
+        // Painel de Configuração da Conexão
         when (manager.mode) {
             ConnectionMode.USB -> {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Box(modifier = Modifier.weight(1.4f)) {
-                        OutlinedButton(
-                            onClick = {
-                                manager.refreshUsbDevices()
-                                usbDropdownExpanded = true
-                            },
-                            enabled = !manager.isConnected,
-                            modifier = Modifier.fillMaxWidth()
-                        ) {
-                            val devLabel = manager.selectedUsbDriver?.let {
-                                it.device.productName ?: it.javaClass.simpleName.replace("SerialDriver", "")
-                            } ?: "Nenhum USB"
-                            Text(devLabel, maxLines = 1)
-                        }
-                        DropdownMenu(
-                            expanded = usbDropdownExpanded,
-                            onDismissRequest = { usbDropdownExpanded = false }
-                        ) {
-                            if (manager.usbDrivers.isEmpty()) {
-                                DropdownMenuItem(
-                                    text = { Text("Nenhuma placa detectada") },
-                                    onClick = { usbDropdownExpanded = false }
-                                )
-                            } else {
-                                manager.usbDrivers.forEach { drv ->
-                                    val name = drv.device.productName
-                                        ?: drv.javaClass.simpleName.replace("SerialDriver", "")
+                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Box(modifier = Modifier.weight(1.4f)) {
+                            OutlinedButton(
+                                onClick = {
+                                    manager.refreshUsbDevices()
+                                    usbDropdownExpanded = true
+                                },
+                                enabled = !manager.isConnected,
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                val devLabel = manager.selectedUsbDriver?.let {
+                                    it.device.productName ?: it.javaClass.simpleName.replace("SerialDriver", "")
+                                } ?: "Nenhum USB"
+                                Text(devLabel, maxLines = 1)
+                            }
+                            DropdownMenu(
+                                expanded = usbDropdownExpanded,
+                                onDismissRequest = { usbDropdownExpanded = false }
+                            ) {
+                                if (manager.usbDrivers.isEmpty()) {
                                     DropdownMenuItem(
-                                        text = { Text("$name (VID:${drv.device.vendorId})") },
+                                        text = { Text("Nenhuma placa detectada") },
+                                        onClick = { usbDropdownExpanded = false }
+                                    )
+                                } else {
+                                    manager.usbDrivers.forEach { drv ->
+                                        val name = drv.device.productName
+                                            ?: drv.javaClass.simpleName.replace("SerialDriver", "")
+                                        DropdownMenuItem(
+                                            text = { Text("$name (VID:${drv.device.vendorId})") },
+                                            onClick = {
+                                                manager.selectedUsbDriver = drv
+                                                usbDropdownExpanded = false
+                                            }
+                                        )
+                                    }
+                                }
+                            }
+                        }
+
+                        Box(modifier = Modifier.weight(0.9f)) {
+                            OutlinedButton(
+                                onClick = { baudDropdownExpanded = true },
+                                enabled = !manager.isConnected,
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Text("${manager.selectedBaudRate}")
+                            }
+                            DropdownMenu(
+                                expanded = baudDropdownExpanded,
+                                onDismissRequest = { baudDropdownExpanded = false }
+                            ) {
+                                manager.baudRates.forEach { rate ->
+                                    DropdownMenuItem(
+                                        text = { Text("$rate bps") },
                                         onClick = {
-                                            manager.selectedUsbDriver = drv
-                                            usbDropdownExpanded = false
+                                            manager.selectedBaudRate = rate
+                                            baudDropdownExpanded = false
                                         }
                                     )
                                 }
                             }
                         }
+
+                        Button(
+                            onClick = { if (manager.isConnected) manager.disconnect() else manager.connect() },
+                            enabled = !manager.isFlashing,
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = if (manager.isConnected) Color(0xFFB71C1C) else MaterialTheme.colorScheme.primary
+                            )
+                        ) {
+                            Text(if (manager.isConnected) "Sair" else "Conectar")
+                        }
                     }
 
-                    Box(modifier = Modifier.weight(0.9f)) {
-                        OutlinedButton(
-                            onClick = { baudDropdownExpanded = true },
-                            enabled = !manager.isConnected,
-                            modifier = Modifier.fillMaxWidth()
+                    // Painel de Gravação Nativa (.hex / .bin)
+                    Surface(
+                        color = Color(0xFF1E1E1E),
+                        shape = RoundedCornerShape(8.dp),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Column(
+                            modifier = Modifier.padding(8.dp),
+                            verticalArrangement = Arrangement.spacedBy(6.dp)
                         ) {
-                            Text("${manager.selectedBaudRate}")
-                        }
-                        DropdownMenu(
-                            expanded = baudDropdownExpanded,
-                            onDismissRequest = { baudDropdownExpanded = false }
-                        ) {
-                            manager.baudRates.forEach { rate ->
-                                DropdownMenuItem(
-                                    text = { Text("$rate bps") },
-                                    onClick = {
-                                        manager.selectedBaudRate = rate
-                                        baudDropdownExpanded = false
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Box(modifier = Modifier.weight(1.4f)) {
+                                    OutlinedButton(
+                                        onClick = { targetDropdownExpanded = true },
+                                        enabled = !manager.isFlashing,
+                                        modifier = Modifier.fillMaxWidth(),
+                                        contentPadding = PaddingValues(horizontal = 8.dp)
+                                    ) {
+                                        Text(
+                                            text = manager.selectedFlashTarget.label,
+                                            fontSize = 11.sp,
+                                            maxLines = 1
+                                        )
                                     }
+                                    DropdownMenu(
+                                        expanded = targetDropdownExpanded,
+                                        onDismissRequest = { targetDropdownExpanded = false }
+                                    ) {
+                                        FlashTarget.entries.forEach { target ->
+                                            DropdownMenuItem(
+                                                text = { Text(target.label) },
+                                                onClick = {
+                                                    manager.selectedFlashTarget = target
+                                                    targetDropdownExpanded = false
+                                                }
+                                            )
+                                        }
+                                    }
+                                }
+
+                                Button(
+                                    onClick = { filePickerLauncher.launch(arrayOf("*/*")) },
+                                    enabled = manager.isConnected && !manager.isFlashing,
+                                    modifier = Modifier.weight(1f),
+                                    contentPadding = PaddingValues(horizontal = 8.dp)
+                                ) {
+                                    Text("Gravar .hex/.bin", fontSize = 11.sp, maxLines = 1)
+                                }
+                            }
+
+                            if (manager.isFlashing) {
+                                LinearProgressIndicator(
+                                    progress = { manager.flashProgress },
+                                    modifier = Modifier.fillMaxWidth()
                                 )
                             }
                         }
-                    }
-
-                    Button(
-                        onClick = { if (manager.isConnected) manager.disconnect() else manager.connect() },
-                        colors = ButtonDefaults.buttonColors(
-                            containerColor = if (manager.isConnected) Color(0xFFB71C1C) else MaterialTheme.colorScheme.primary
-                        )
-                    ) {
-                        Text(if (manager.isConnected) "Sair" else "Conectar")
                     }
                 }
             }
@@ -298,6 +380,7 @@ fun SerialBridgeScreen() {
             }
         }
 
+        // Botões Rápidos de Comando
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.spacedBy(8.dp)
@@ -313,6 +396,7 @@ fun SerialBridgeScreen() {
             }
         }
 
+        // Controle Analógico (PWM)
         Column {
             Text("Controle Analógico (PWM): ${sliderValue.toInt()}", fontSize = 12.sp)
             Slider(
@@ -325,6 +409,7 @@ fun SerialBridgeScreen() {
             )
         }
 
+        // Console Serial (RX / TX / FLASH)
         Box(
             modifier = Modifier
                 .weight(1f)
@@ -337,6 +422,7 @@ fun SerialBridgeScreen() {
                     val color = when {
                         log.contains("TX:") -> Color(0xFF81D4FA)
                         log.contains("RX:") -> Color(0xFFA5D6A7)
+                        log.contains("FLASH:") -> Color(0xFFFFCC80)
                         log.contains("ERR:") -> Color(0xFFEF9A9A)
                         else -> Color(0xFFB0BEC5)
                     }
@@ -350,6 +436,7 @@ fun SerialBridgeScreen() {
             }
         }
 
+        // Envio Manual
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.spacedBy(8.dp),

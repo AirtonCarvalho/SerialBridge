@@ -9,6 +9,7 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -26,6 +27,7 @@ import androidx.compose.ui.input.key.KeyEventType
 import androidx.compose.ui.input.key.key
 import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.key.type
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.font.FontFamily
@@ -34,7 +36,11 @@ import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -64,13 +70,23 @@ fun SerialBridgeScreen() {
     var baudDropdownExpanded by remember { mutableStateOf(false) }
     var targetDropdownExpanded by remember { mutableStateOf(false) }
     var btDropdownExpanded by remember { mutableStateOf(false) }
+    var activeTab by remember { mutableIntStateOf(0) } // 0 = Terminal, 1 = Plotter, 2 = G-code / HEX
     var sliderValue by remember { mutableFloatStateOf(0f) }
 
-    // Estados do Shell / Histórico estilo Linux
+    // Histórico estilo Linux
     var commandField by remember { mutableStateOf(TextFieldValue("")) }
     val commandHistory = remember { mutableStateListOf<String>() }
-    var historyIndex by remember { mutableIntStateOf(-1) } // -1 = linha atual em edição
+    var historyIndex by remember { mutableIntStateOf(-1) }
     var draftBeforeHistory by remember { mutableStateOf("") }
+
+    // Auto-scroll inteligente: acompanha o fim se o usuário estiver na base do console
+    val isAtBottom by remember {
+        derivedStateOf {
+            val lastVisible = listState.layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: 0
+            val total = listState.layoutInfo.totalItemsCount
+            total == 0 || lastVisible >= total - 3
+        }
+    }
 
     fun navigateHistoryUp() {
         if (commandHistory.isEmpty()) return
@@ -103,7 +119,6 @@ fun SerialBridgeScreen() {
         val raw = commandField.text.trim()
         if (raw.isEmpty()) return
 
-        // Salva no histórico (evitando duplicatas seguidas, igual ao HISTCONTROL=ignoredups do bash)
         if (commandHistory.lastOrNull() != raw) {
             commandHistory.add(raw)
         }
@@ -111,29 +126,35 @@ fun SerialBridgeScreen() {
         draftBeforeHistory = ""
         commandField = TextFieldValue("")
 
-        // Comandos internos locais estilo terminal Linux
         when (raw.lowercase()) {
-            "clear" -> {
-                manager.logs.clear()
-            }
+            "clear" -> manager.logs.clear()
             "history" -> {
                 manager.appendLog("SYS", "--- Histórico de Comandos ---")
                 commandHistory.forEachIndexed { idx, item ->
                     manager.appendLog("SYS", "${idx + 1}  $item")
                 }
             }
-            else -> {
-                manager.sendCommand(raw)
-            }
+            else -> manager.sendCommand(raw)
         }
     }
 
-    val filePickerLauncher = rememberLauncherForActivityResult(
+    // Launchers de Arquivo (Firmware, G-code e Exportar Log)
+    val firmwarePickerLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.OpenDocument()
     ) { uri ->
-        if (uri != null) {
-            manager.flashFirmwareFromUri(uri)
-        }
+        if (uri != null) manager.flashFirmwareFromUri(uri)
+    }
+
+    val scriptPickerLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocument()
+    ) { uri ->
+        if (uri != null) manager.startScriptFromUri(uri)
+    }
+
+    val exportLogLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.CreateDocument("text/plain")
+    ) { uri ->
+        if (uri != null) manager.exportLogsToUri(uri)
     }
 
     val permissionLauncher = rememberLauncherForActivityResult(
@@ -146,7 +167,7 @@ fun SerialBridgeScreen() {
     DisposableEffect(manager) {
         manager.onLogAdded = {
             scope.launch {
-                if (manager.logs.isNotEmpty()) {
+                if (manager.logs.isNotEmpty() && isAtBottom) {
                     listState.animateScrollToItem(manager.logs.size - 1)
                 }
             }
@@ -175,19 +196,19 @@ fun SerialBridgeScreen() {
     Column(
         modifier = Modifier
             .fillMaxSize()
-            .padding(14.dp),
-        verticalArrangement = Arrangement.spacedBy(8.dp)
+            .padding(12.dp),
+        verticalArrangement = Arrangement.spacedBy(6.dp)
     ) {
-        // Cabeçalho e Status
+        // 1. Cabeçalho e Status
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically
         ) {
-            Text("SerialBridge", fontSize = 20.sp, fontWeight = FontWeight.Bold)
+            Text("SerialBridge", fontSize = 19.sp, fontWeight = FontWeight.Bold)
             Surface(
                 color = when {
-                    manager.isFlashing -> Color(0xFFE65100)
+                    manager.isFlashing || manager.isRunningScript -> Color(0xFFE65100)
                     manager.isConnected -> Color(0xFF1B5E20)
                     else -> Color(0xFF424242)
                 },
@@ -196,13 +217,13 @@ fun SerialBridgeScreen() {
                 Text(
                     text = manager.statusText,
                     modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp),
-                    fontSize = 12.sp,
+                    fontSize = 11.sp,
                     color = Color.White
                 )
             }
         }
 
-        // Seletor de Protocolo
+        // 2. Seletor de Protocolo Físico
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             FilterChip(
                 selected = manager.mode == ConnectionMode.USB,
@@ -212,27 +233,27 @@ fun SerialBridgeScreen() {
                         manager.refreshUsbDevices()
                     }
                 },
-                label = { Text("USB (OTG)") }
+                label = { Text("USB (OTG)", fontSize = 12.sp) }
             )
             FilterChip(
                 selected = manager.mode == ConnectionMode.BLUETOOTH,
                 onClick = { if (!manager.isConnected) manager.mode = ConnectionMode.BLUETOOTH },
-                label = { Text("Bluetooth") }
+                label = { Text("Bluetooth", fontSize = 12.sp) }
             )
             FilterChip(
                 selected = manager.mode == ConnectionMode.WIFI,
                 onClick = { if (!manager.isConnected) manager.mode = ConnectionMode.WIFI },
-                label = { Text("Wi-Fi") }
+                label = { Text("Wi-Fi", fontSize = 12.sp) }
             )
         }
 
-        // Painel de Configuração da Conexão
+        // 3. Painel de Conexão + Gravador .hex/.bin
         when (manager.mode) {
             ConnectionMode.USB -> {
                 Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
                     Row(
                         modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Box(modifier = Modifier.weight(1.4f)) {
@@ -242,12 +263,13 @@ fun SerialBridgeScreen() {
                                     usbDropdownExpanded = true
                                 },
                                 enabled = !manager.isConnected,
-                                modifier = Modifier.fillMaxWidth()
+                                modifier = Modifier.fillMaxWidth(),
+                                contentPadding = PaddingValues(horizontal = 8.dp)
                             ) {
                                 val devLabel = manager.selectedUsbDriver?.let {
                                     it.device.productName ?: it.javaClass.simpleName.replace("SerialDriver", "")
                                 } ?: "Nenhum USB"
-                                Text(devLabel, maxLines = 1)
+                                Text(devLabel, maxLines = 1, fontSize = 12.sp)
                             }
                             DropdownMenu(
                                 expanded = usbDropdownExpanded,
@@ -274,13 +296,14 @@ fun SerialBridgeScreen() {
                             }
                         }
 
-                        Box(modifier = Modifier.weight(0.9f)) {
+                        Box(modifier = Modifier.weight(0.85f)) {
                             OutlinedButton(
                                 onClick = { baudDropdownExpanded = true },
                                 enabled = !manager.isConnected,
-                                modifier = Modifier.fillMaxWidth()
+                                modifier = Modifier.fillMaxWidth(),
+                                contentPadding = PaddingValues(horizontal = 6.dp)
                             ) {
-                                Text("${manager.selectedBaudRate}")
+                                Text("${manager.selectedBaudRate}", fontSize = 12.sp)
                             }
                             DropdownMenu(
                                 expanded = baudDropdownExpanded,
@@ -303,25 +326,25 @@ fun SerialBridgeScreen() {
                             enabled = !manager.isFlashing,
                             colors = ButtonDefaults.buttonColors(
                                 containerColor = if (manager.isConnected) Color(0xFFB71C1C) else MaterialTheme.colorScheme.primary
-                            )
+                            ),
+                            contentPadding = PaddingValues(horizontal = 12.dp)
                         ) {
-                            Text(if (manager.isConnected) "Sair" else "Conectar")
+                            Text(if (manager.isConnected) "Sair" else "Conectar", fontSize = 12.sp)
                         }
                     }
 
-                    // Painel de Gravação Nativa (.hex / .bin)
                     Surface(
                         color = Color(0xFF1E1E1E),
                         shape = RoundedCornerShape(8.dp),
                         modifier = Modifier.fillMaxWidth()
                     ) {
                         Column(
-                            modifier = Modifier.padding(8.dp),
-                            verticalArrangement = Arrangement.spacedBy(6.dp)
+                            modifier = Modifier.padding(6.dp),
+                            verticalArrangement = Arrangement.spacedBy(4.dp)
                         ) {
                             Row(
                                 modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                horizontalArrangement = Arrangement.spacedBy(6.dp),
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
                                 Box(modifier = Modifier.weight(1.4f)) {
@@ -354,7 +377,7 @@ fun SerialBridgeScreen() {
                                 }
 
                                 Button(
-                                    onClick = { filePickerLauncher.launch(arrayOf("*/*")) },
+                                    onClick = { firmwarePickerLauncher.launch(arrayOf("*/*")) },
                                     enabled = manager.isConnected && !manager.isFlashing,
                                     modifier = Modifier.weight(1f),
                                     contentPadding = PaddingValues(horizontal = 8.dp)
@@ -389,7 +412,7 @@ fun SerialBridgeScreen() {
                             enabled = !manager.isConnected,
                             modifier = Modifier.fillMaxWidth()
                         ) {
-                            Text(manager.selectedBtDevice?.name ?: "Selecionar Dispositivo")
+                            Text(manager.selectedBtDevice?.name ?: "Selecionar Dispositivo", fontSize = 12.sp)
                         }
                         DropdownMenu(
                             expanded = btDropdownExpanded,
@@ -412,7 +435,7 @@ fun SerialBridgeScreen() {
                             containerColor = if (manager.isConnected) Color(0xFFB71C1C) else MaterialTheme.colorScheme.primary
                         )
                     ) {
-                        Text(if (manager.isConnected) "Sair" else "Conectar")
+                        Text(if (manager.isConnected) "Sair" else "Conectar", fontSize = 12.sp)
                     }
                 }
             }
@@ -445,10 +468,396 @@ fun SerialBridgeScreen() {
                             containerColor = if (manager.isConnected) Color(0xFFB71C1C) else MaterialTheme.colorScheme.primary
                         )
                     ) {
-                        Text(if (manager.isConnected) "Sair" else "Conectar")
+                        Text(if (manager.isConnected) "Sair" else "Conectar", fontSize = 12.sp)
                     }
                 }
             }
         }
 
-        // Botões Rápidos de Co
+        // 4. Abas de Ferramentas (Terminal | Plotter D-Pad | G-code & HEX)
+        TabRow(selectedTabIndex = activeTab, modifier = Modifier.fillMaxWidth()) {
+            Tab(
+                selected = activeTab == 0,
+                onClick = { activeTab = 0 },
+                text = { Text("Terminal", fontSize = 12.sp) }
+            )
+            Tab(
+                selected = activeTab == 1,
+                onClick = { activeTab = 1 },
+                text = { Text("Plotter", fontSize = 12.sp) }
+            )
+            Tab(
+                selected = activeTab == 2,
+                onClick = { activeTab = 2 },
+                text = { Text("G-code / HEX", fontSize = 12.sp) }
+            )
+        }
+
+        when (activeTab) {
+            // ABA 0: CONTROLES RÁPIDOS + PWM
+            0 -> {
+                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        listOf("LED_ON", "LED_OFF", "STATUS", "STOP").forEach { cmd ->
+                            FilledTonalButton(
+                                onClick = { manager.sendCommand(cmd) },
+                                modifier = Modifier.weight(1f),
+                                contentPadding = PaddingValues(horizontal = 4.dp)
+                            ) {
+                                Text(cmd, fontSize = 11.sp, maxLines = 1)
+                            }
+                        }
+                    }
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Text("PWM: ${sliderValue.toInt()}", fontSize = 12.sp)
+                        Slider(
+                            value = sliderValue,
+                            onValueChange = { sliderValue = it },
+                            valueRange = 0f..255f,
+                            modifier = Modifier.weight(1f),
+                            onValueChangeFinished = {
+                                manager.sendCommand("PWM:${sliderValue.toInt()}")
+                            }
+                        )
+                    }
+                }
+            }
+
+            // ABA 1: D-PAD CONTÍNUO (PRESS & HOLD) PARA CODBOX PLOTTER
+            1 -> {
+                Surface(
+                    color = Color(0xFF1A1A1A),
+                    shape = RoundedCornerShape(8.dp),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(8.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        // Cruz Direcional X / Y (envia enquanto segura, manda STOP ao soltar)
+                        Column(
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                            verticalArrangement = Arrangement.spacedBy(4.dp)
+                        ) {
+                            HoldActionButton(label = "Y+ (Papel)", command = "Y+", manager = manager)
+                            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                HoldActionButton(label = "X- (Esq)", command = "X-", manager = manager)
+                                Button(
+                                    onClick = { manager.sendCommand("STOP") },
+                                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFB71C1C)),
+                                    contentPadding = PaddingValues(horizontal = 10.dp),
+                                    modifier = Modifier.height(36.dp)
+                                ) {
+                                    Text("STOP", fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                                }
+                                HoldActionButton(label = "X+ (Dir)", command = "X+", manager = manager)
+                            }
+                            HoldActionButton(label = "Y- (Recua)", command = "Y-", manager = manager)
+                        }
+
+                        // Ações de Caneta e Home
+                        Column(
+                            verticalArrangement = Arrangement.spacedBy(6.dp),
+                            horizontalAlignment = Alignment.End
+                        ) {
+                            FilledTonalButton(
+                                onClick = { manager.sendCommand("PEN_UP") },
+                                contentPadding = PaddingValues(horizontal = 10.dp),
+                                modifier = Modifier.height(34.dp)
+                            ) {
+                                Text("CANETA ↑", fontSize = 11.sp)
+                            }
+                            FilledTonalButton(
+                                onClick = { manager.sendCommand("PEN_DOWN") },
+                                contentPadding = PaddingValues(horizontal = 10.dp),
+                                modifier = Modifier.height(34.dp)
+                            ) {
+                                Text("CANETA ↓", fontSize = 11.sp)
+                            }
+                            OutlinedButton(
+                                onClick = { manager.sendCommand("HOME") },
+                                contentPadding = PaddingValues(horizontal = 10.dp),
+                                modifier = Modifier.height(34.dp)
+                            ) {
+                                Text("HOME (0,0)", fontSize = 11.sp)
+                            }
+                        }
+                    }
+                }
+            }
+
+            // ABA 2: EXECUTOR DE G-CODE + MODO HEX + TERMINADOR DE LINHA
+            2 -> {
+                Surface(
+                    color = Color(0xFF1A1A1A),
+                    shape = RoundedCornerShape(8.dp),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Column(
+                        modifier = Modifier.padding(8.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        // Linha 1: Carregar G-code / Pausar / Abortar
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(6.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Button(
+                                onClick = { scriptPickerLauncher.launch(arrayOf("*/*")) },
+                                enabled = manager.isConnected && !manager.isRunningScript,
+                                modifier = Modifier.weight(1.3f),
+                                contentPadding = PaddingValues(horizontal = 8.dp)
+                            ) {
+                                Text("Rodar G-code / .txt", fontSize = 11.sp)
+                            }
+
+                            if (manager.isRunningScript) {
+                                FilledTonalButton(
+                                    onClick = { manager.isScriptPaused = !manager.isScriptPaused },
+                                    contentPadding = PaddingValues(horizontal = 8.dp)
+                                ) {
+                                    Text(if (manager.isScriptPaused) "Retomar" else "Pausar", fontSize = 11.sp)
+                                }
+                                Button(
+                                    onClick = { manager.stopScript() },
+                                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFB71C1C)),
+                                    contentPadding = PaddingValues(horizontal = 8.dp)
+                                ) {
+                                    Text("Parar", fontSize = 11.sp)
+                                }
+                            }
+                        }
+
+                        if (manager.isRunningScript) {
+                            Text(manager.scriptStatusLine, fontSize = 11.sp, color = Color(0xFFFFCC80))
+                            LinearProgressIndicator(
+                                progress = { manager.scriptProgress },
+                                modifier = Modifier.fillMaxWidth()
+                            )
+                        }
+
+                        // Linha 2: Terminador (\n, \r\n, Nenhum) + Chaves HEX
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                                LineEnding.entries.forEach { ending ->
+                                    FilterChip(
+                                        selected = manager.lineEnding == ending,
+                                        onClick = { manager.lineEnding = ending },
+                                        label = { Text(ending.label, fontSize = 10.sp) }
+                                    )
+                                }
+                            }
+
+                            Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                                FilterChip(
+                                    selected = manager.hexViewMode,
+                                    onClick = { manager.hexViewMode = !manager.hexViewMode },
+                                    label = { Text("Ver HEX", fontSize = 10.sp) }
+                                )
+                                FilterChip(
+                                    selected = manager.sendAsHexBytes,
+                                    onClick = { manager.sendAsHexBytes = !manager.sendAsHexBytes },
+                                    label = { Text("TX HEX", fontSize = 10.sp) }
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 5. Barra Superior do Console (Contador + Exportar Log + Limpar)
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(
+                text = "Console (${manager.logs.size})" + if (!isAtBottom) " [Scroll pausado]" else "",
+                fontSize = 11.sp,
+                color = if (!isAtBottom) Color(0xFFFFCC80) else Color(0xFF90A4AE)
+            )
+            Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                TextButton(
+                    onClick = {
+                        val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.getDefault()).format(Date())
+                        exportLogLauncher.launch("SerialBridge_$stamp.txt")
+                    },
+                    enabled = manager.logs.isNotEmpty(),
+                    contentPadding = PaddingValues(horizontal = 6.dp, vertical = 0.dp),
+                    modifier = Modifier.height(26.dp)
+                ) {
+                    Text("Salvar Log", fontSize = 11.sp)
+                }
+                TextButton(
+                    onClick = { manager.logs.clear() },
+                    contentPadding = PaddingValues(horizontal = 6.dp, vertical = 0.dp),
+                    modifier = Modifier.height(26.dp)
+                ) {
+                    Text("Limpar", fontSize = 11.sp)
+                }
+            }
+        }
+
+        // 6. Console Serial (RX / TX / FLASH)
+        Box(
+            modifier = Modifier
+                .weight(1f)
+                .fillMaxWidth()
+                .background(Color(0xFF121212), RoundedCornerShape(8.dp))
+                .padding(8.dp)
+        ) {
+            LazyColumn(state = listState, modifier = Modifier.fillMaxSize()) {
+                items(manager.logs) { log ->
+                    val color = when {
+                        log.contains("TX") -> Color(0xFF81D4FA)
+                        log.contains("RX") -> Color(0xFFA5D6A7)
+                        log.contains("FLASH:") -> Color(0xFFFFCC80)
+                        log.contains("ERR:") -> Color(0xFFEF9A9A)
+                        else -> Color(0xFFB0BEC5)
+                    }
+                    Text(
+                        text = log,
+                        color = color,
+                        fontFamily = FontFamily.Monospace,
+                        fontSize = 12.sp
+                    )
+                }
+            }
+        }
+
+        // 7. Campo de Entrada Manual com Histórico Linux (↑/↓)
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            OutlinedTextField(
+                value = commandField,
+                onValueChange = {
+                    commandField = it
+                    historyIndex = -1
+                },
+                placeholder = {
+                    Text(
+                        if (manager.sendAsHexBytes) "Bytes HEX (ex: 1B 40 0D)..." else "Comando (clear, history...)",
+                        fontSize = 12.sp
+                    )
+                },
+                singleLine = true,
+                keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
+                keyboardActions = KeyboardActions(onSend = { executeCommand() }),
+                modifier = Modifier
+                    .weight(1f)
+                    .onPreviewKeyEvent { event ->
+                        if (event.type == KeyEventType.KeyDown) {
+                            when (event.key) {
+                                Key.DirectionUp -> {
+                                    navigateHistoryUp()
+                                    true
+                                }
+                                Key.DirectionDown -> {
+                                    navigateHistoryDown()
+                                    true
+                                }
+                                Key.Enter, Key.NumPadEnter -> {
+                                    executeCommand()
+                                    true
+                                }
+                                else -> false
+                            }
+                        } else {
+                            false
+                        }
+                    }
+            )
+
+            Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                FilledTonalButton(
+                    onClick = { navigateHistoryUp() },
+                    enabled = commandHistory.isNotEmpty(),
+                    contentPadding = PaddingValues(0.dp),
+                    modifier = Modifier.size(width = 36.dp, height = 26.dp)
+                ) {
+                    Text("↑", fontSize = 13.sp, fontWeight = FontWeight.Bold)
+                }
+                FilledTonalButton(
+                    onClick = { navigateHistoryDown() },
+                    enabled = historyIndex != -1,
+                    contentPadding = PaddingValues(0.dp),
+                    modifier = Modifier.size(width = 36.dp, height = 26.dp)
+                ) {
+                    Text("↓", fontSize = 13.sp, fontWeight = FontWeight.Bold)
+                }
+            }
+
+            Button(onClick = { executeCommand() }) {
+                Text("Enviar")
+            }
+        }
+    }
+}
+
+@Composable
+fun HoldActionButton(
+    label: String,
+    command: String,
+    manager: SerialConnectionManager
+) {
+    var isPressed by remember { mutableStateOf(false) }
+
+    LaunchedEffect(isPressed) {
+        if (isPressed) {
+            manager.sendCommand(command, silent = false)
+            while (isPressed) {
+                delay(140)
+                manager.sendCommand(command, silent = true)
+            }
+            manager.sendCommand("STOP", silent = false)
+        }
+    }
+
+    Surface(
+        color = if (isPressed) MaterialTheme.colorScheme.primary else Color(0xFF2C2C2C),
+        shape = RoundedCornerShape(8.dp),
+        modifier = Modifier
+            .height(36.dp)
+            .pointerInput(command) {
+                detectTapGestures(
+                    onPress = {
+                        isPressed = true
+                        tryAwaitRelease()
+                        isPressed = false
+                    }
+                )
+            }
+    ) {
+        Box(
+            contentAlignment = Alignment.Center,
+            modifier = Modifier.padding(horizontal = 10.dp)
+        ) {
+            Text(
+                text = label,
+                fontSize = 11.sp,
+                fontWeight = FontWeight.Medium,
+                color = if (isPressed) Color.Black else Color.White
+            )
+        }
+    }
+}

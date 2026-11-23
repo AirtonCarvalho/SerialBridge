@@ -14,14 +14,24 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.input.key.Key
+import androidx.compose.ui.input.key.KeyEventType
+import androidx.compose.ui.input.key.key
+import androidx.compose.ui.input.key.onPreviewKeyEvent
+import androidx.compose.ui.input.key.type
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.launch
@@ -54,8 +64,69 @@ fun SerialBridgeScreen() {
     var baudDropdownExpanded by remember { mutableStateOf(false) }
     var targetDropdownExpanded by remember { mutableStateOf(false) }
     var btDropdownExpanded by remember { mutableStateOf(false) }
-    var commandInput by remember { mutableStateOf("") }
     var sliderValue by remember { mutableFloatStateOf(0f) }
+
+    // Estados do Shell / Histórico estilo Linux
+    var commandField by remember { mutableStateOf(TextFieldValue("")) }
+    val commandHistory = remember { mutableStateListOf<String>() }
+    var historyIndex by remember { mutableIntStateOf(-1) } // -1 = linha atual em edição
+    var draftBeforeHistory by remember { mutableStateOf("") }
+
+    fun navigateHistoryUp() {
+        if (commandHistory.isEmpty()) return
+        if (historyIndex == -1) {
+            draftBeforeHistory = commandField.text
+            historyIndex = commandHistory.lastIndex
+        } else if (historyIndex > 0) {
+            historyIndex--
+        }
+        val selected = commandHistory[historyIndex]
+        commandField = TextFieldValue(text = selected, selection = TextRange(selected.length))
+    }
+
+    fun navigateHistoryDown() {
+        if (historyIndex == -1) return
+        if (historyIndex < commandHistory.lastIndex) {
+            historyIndex++
+            val selected = commandHistory[historyIndex]
+            commandField = TextFieldValue(text = selected, selection = TextRange(selected.length))
+        } else {
+            historyIndex = -1
+            commandField = TextFieldValue(
+                text = draftBeforeHistory,
+                selection = TextRange(draftBeforeHistory.length)
+            )
+        }
+    }
+
+    fun executeCommand() {
+        val raw = commandField.text.trim()
+        if (raw.isEmpty()) return
+
+        // Salva no histórico (evitando duplicatas seguidas, igual ao HISTCONTROL=ignoredups do bash)
+        if (commandHistory.lastOrNull() != raw) {
+            commandHistory.add(raw)
+        }
+        historyIndex = -1
+        draftBeforeHistory = ""
+        commandField = TextFieldValue("")
+
+        // Comandos internos locais estilo terminal Linux
+        when (raw.lowercase()) {
+            "clear" -> {
+                manager.logs.clear()
+            }
+            "history" -> {
+                manager.appendLog("SYS", "--- Histórico de Comandos ---")
+                commandHistory.forEachIndexed { idx, item ->
+                    manager.appendLog("SYS", "${idx + 1}  $item")
+                }
+            }
+            else -> {
+                manager.sendCommand(raw)
+            }
+        }
+    }
 
     val filePickerLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.OpenDocument()
@@ -380,83 +451,4 @@ fun SerialBridgeScreen() {
             }
         }
 
-        // Botões Rápidos de Comando
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(8.dp)
-        ) {
-            listOf("LED_ON", "LED_OFF", "STATUS", "STOP").forEach { cmd ->
-                FilledTonalButton(
-                    onClick = { manager.sendCommand(cmd) },
-                    modifier = Modifier.weight(1f),
-                    contentPadding = PaddingValues(horizontal = 4.dp)
-                ) {
-                    Text(cmd, fontSize = 11.sp, maxLines = 1)
-                }
-            }
-        }
-
-        // Controle Analógico (PWM)
-        Column {
-            Text("Controle Analógico (PWM): ${sliderValue.toInt()}", fontSize = 12.sp)
-            Slider(
-                value = sliderValue,
-                onValueChange = { sliderValue = it },
-                valueRange = 0f..255f,
-                onValueChangeFinished = {
-                    manager.sendCommand("PWM:${sliderValue.toInt()}")
-                }
-            )
-        }
-
-        // Console Serial (RX / TX / FLASH)
-        Box(
-            modifier = Modifier
-                .weight(1f)
-                .fillMaxWidth()
-                .background(Color(0xFF121212), RoundedCornerShape(8.dp))
-                .padding(8.dp)
-        ) {
-            LazyColumn(state = listState, modifier = Modifier.fillMaxSize()) {
-                items(manager.logs) { log ->
-                    val color = when {
-                        log.contains("TX:") -> Color(0xFF81D4FA)
-                        log.contains("RX:") -> Color(0xFFA5D6A7)
-                        log.contains("FLASH:") -> Color(0xFFFFCC80)
-                        log.contains("ERR:") -> Color(0xFFEF9A9A)
-                        else -> Color(0xFFB0BEC5)
-                    }
-                    Text(
-                        text = log,
-                        color = color,
-                        fontFamily = FontFamily.Monospace,
-                        fontSize = 12.sp
-                    )
-                }
-            }
-        }
-
-        // Envio Manual
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            OutlinedTextField(
-                value = commandInput,
-                onValueChange = { commandInput = it },
-                placeholder = { Text("Enviar comando...") },
-                singleLine = true,
-                modifier = Modifier.weight(1f)
-            )
-            Button(onClick = {
-                if (commandInput.isNotBlank()) {
-                    manager.sendCommand(commandInput)
-                    commandInput = ""
-                }
-            }) {
-                Text("Enviar")
-            }
-        }
-    }
-}
+        // Botões Rápidos de Co

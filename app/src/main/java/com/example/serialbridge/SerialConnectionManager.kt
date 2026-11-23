@@ -25,14 +25,14 @@ import androidx.core.content.ContextCompat
 import com.hoho.android.usbserial.driver.UsbSerialDriver
 import com.hoho.android.usbserial.driver.UsbSerialPort
 import com.hoho.android.usbserial.driver.UsbSerialProber
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import java.io.BufferedReader
-import java.io.InputStreamReader
+import kotlinx.coroutines.withTimeoutOrNull
 import java.io.OutputStream
 import java.net.InetSocketAddress
 import java.net.Socket
@@ -42,6 +42,12 @@ import java.util.Locale
 import java.util.UUID
 
 enum class ConnectionMode { USB, BLUETOOTH, WIFI }
+
+enum class LineEnding(val label: String, val suffix: String) {
+    LF("LF (\\n)", "\n"),
+    CRLF("CRLF (\\r\\n)", "\r\n"),
+    NONE("Nenhum", "")
+}
 
 private const val ACTION_USB_PERMISSION = "com.example.serialbridge.USB_PERMISSION"
 
@@ -56,10 +62,23 @@ class SerialConnectionManager(
     var statusText by mutableStateOf("Desconectado")
     var hasBtPermission by mutableStateOf(checkBtPermissions())
 
+    // Configurações de Protocolo / Engenharia Reversa
+    var lineEnding by mutableStateOf(LineEnding.LF)
+    var hexViewMode by mutableStateOf(false)
+    var sendAsHexBytes by mutableStateOf(false)
+
     // Estados de Gravação (Firmware Flasher)
     var selectedFlashTarget by mutableStateOf(FlashTarget.ARDUINO_115200)
     var isFlashing by mutableStateOf(false)
     var flashProgress by mutableFloatStateOf(0f)
+
+    // Estados do Executor de G-code / Script em Lote
+    var isRunningScript by mutableStateOf(false)
+    var isScriptPaused by mutableStateOf(false)
+    var scriptProgress by mutableFloatStateOf(0f)
+    var scriptStatusLine by mutableStateOf("")
+    private var scriptJob: Job? = null
+    private var ackSignal: CompletableDeferred<Boolean>? = null
 
     // Estados Bluetooth
     private val btManager = context.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
@@ -135,7 +154,28 @@ class SerialConnectionManager(
     fun appendLog(prefix: String, msg: String) {
         val time = SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date())
         logs.add("[$time] $prefix: $msg")
+        if (logs.size > 1500) {
+            logs.removeAt(0)
+        }
         onLogAdded?.invoke()
+    }
+
+    fun exportLogsToUri(uri: Uri) {
+        scope.launch(Dispatchers.IO) {
+            try {
+                val snapshot = logs.toList().joinToString("\n")
+                context.contentResolver.openOutputStream(uri)?.use { out ->
+                    out.write(snapshot.toByteArray(Charsets.UTF_8))
+                }
+                withContext(Dispatchers.Main) {
+                    appendLog("SYS", "Log exportado com sucesso (${logs.size} linhas)")
+                }
+            } catch (e: Exception) {
+                withContext(Dispatchers.Main) {
+                    appendLog("ERR", "Falha ao exportar log: ${e.message}")
+                }
+            }
+        }
     }
 
     fun refreshPairedDevices() {
@@ -155,6 +195,92 @@ class SerialConnectionManager(
         }
     }
 
+    // =========================================================================
+    // EXECUTOR DE SCRIPT / G-CODE LINHA A LINHA COM CONTROLE DE FLUXO (OK)
+    // =========================================================================
+    fun startScriptFromUri(uri: Uri) {
+        if (!isConnected) {
+            appendLog("ERR", "Conecte a uma placa antes de rodar um script.")
+            return
+        }
+        if (isFlashing || isRunningScript) return
+
+        scriptJob = scope.launch(Dispatchers.IO) {
+            try {
+                val rawText = context.contentResolver.openInputStream(uri)?.bufferedReader()?.use { it.readText() }
+                    ?: throw Exception("Não foi possível ler o arquivo")
+
+                val commands = rawText.lines()
+                    .map { line ->
+                        // Remove comentários G-code (; ou entre parênteses)
+                        line.substringBefore(";").replace(Regex("\\(.*?\\)"), "").trim()
+                    }
+                    .filter { it.isNotEmpty() }
+
+                if (commands.isEmpty()) throw Exception("Nenhum comando válido encontrado no arquivo")
+
+                withContext(Dispatchers.Main) {
+                    isRunningScript = true
+                    isScriptPaused = false
+                    scriptProgress = 0f
+                    appendLog("SYS", "Iniciando script: ${commands.size} comandos")
+                }
+
+                for ((index, cmd) in commands.withIndex()) {
+                    while (isScriptPaused && isActive) {
+                        kotlinx.coroutines.delay(100)
+                    }
+                    if (!isActive || !isConnected) break
+
+                    withContext(Dispatchers.Main) {
+                        scriptStatusLine = "[${index + 1}/${commands.size}] $cmd"
+                    }
+
+                    val ack = CompletableDeferred<Boolean>()
+                    ackSignal = ack
+
+                    writeRawString("$cmd\n", logLabel = "TX")
+
+                    // Aguarda "OK" da placa (timeout de 5s para movimentos longos)
+                    withTimeoutOrNull(5000) { ack.await() }
+                    ackSignal = null
+
+                    withContext(Dispatchers.Main) {
+                        scriptProgress = (index + 1).toFloat() / commands.size.toFloat()
+                    }
+                }
+
+                withContext(Dispatchers.Main) {
+                    appendLog("SYS", "Execução do script finalizada.")
+                }
+            } catch (e: Exception) {
+                withContext(Dispatchers.Main) {
+                    appendLog("ERR", "Erro no script: ${e.message}")
+                }
+            } finally {
+                ackSignal = null
+                withContext(Dispatchers.Main) {
+                    isRunningScript = false
+                    isScriptPaused = false
+                    scriptStatusLine = ""
+                }
+            }
+        }
+    }
+
+    fun stopScript() {
+        scriptJob?.cancel()
+        ackSignal?.cancel()
+        isRunningScript = false
+        isScriptPaused = false
+        scriptStatusLine = ""
+        sendCommand("STOP", silent = false)
+        appendLog("SYS", "Script abortado pelo usuário.")
+    }
+
+    // =========================================================================
+    // GRAVADOR DE FIRMWARE (.HEX / .BIN)
+    // =========================================================================
     fun flashFirmwareFromUri(uri: Uri) {
         val port = usbPort
         if (!isConnected || mode != ConnectionMode.USB || port == null) {
@@ -164,7 +290,6 @@ class SerialConnectionManager(
         if (isFlashing) return
 
         scope.launch(Dispatchers.IO) {
-            // Pausa a thread de leitura serial para assumir controle exclusivo do barramento USB
             readerJob?.cancel()
             readerJob?.join()
 
@@ -186,21 +311,12 @@ class SerialConnectionManager(
                 }
 
                 when (selectedFlashTarget) {
-                    FlashTarget.ARDUINO_115200 -> {
-                        FirmwareFlasher.flashArduinoHex(port, fileBytes, 115200, logCallback, progressCallback)
-                    }
-                    FlashTarget.ARDUINO_57600 -> {
-                        FirmwareFlasher.flashArduinoHex(port, fileBytes, 57600, logCallback, progressCallback)
-                    }
-                    FlashTarget.ESP32_APP -> {
-                        FirmwareFlasher.flashEsp32Bin(port, fileBytes, 0x10000, logCallback, progressCallback)
-                    }
-                    FlashTarget.ESP32_MERGED -> {
-                        FirmwareFlasher.flashEsp32Bin(port, fileBytes, 0x0, logCallback, progressCallback)
-                    }
+                    FlashTarget.ARDUINO_115200 -> FirmwareFlasher.flashArduinoHex(port, fileBytes, 115200, logCallback, progressCallback)
+                    FlashTarget.ARDUINO_57600 -> FirmwareFlasher.flashArduinoHex(port, fileBytes, 57600, logCallback, progressCallback)
+                    FlashTarget.ESP32_APP -> FirmwareFlasher.flashEsp32Bin(port, fileBytes, 0x10000, logCallback, progressCallback)
+                    FlashTarget.ESP32_MERGED -> FirmwareFlasher.flashEsp32Bin(port, fileBytes, 0x0, logCallback, progressCallback)
                 }
 
-                // Restaura a taxa de comunicação do console serial após a gravação
                 port.setParameters(selectedBaudRate, 8, UsbSerialPort.STOPBITS_1, UsbSerialPort.PARITY_NONE)
                 withContext(Dispatchers.Main) {
                     statusText = "USB: $selectedBaudRate bps"
@@ -235,6 +351,7 @@ class SerialConnectionManager(
     }
 
     fun disconnect() {
+        scriptJob?.cancel()
         readerJob?.cancel()
         try {
             outputStream?.close()
@@ -248,40 +365,71 @@ class SerialConnectionManager(
         usbPort = null
         isConnected = false
         isFlashing = false
+        isRunningScript = false
         statusText = "Desconectado"
         appendLog("SYS", "Conexão encerrada")
     }
 
-    fun sendCommand(cmd: String) {
+    fun sendCommand(cmd: String, silent: Boolean = false) {
         if (isFlashing) {
-            appendLog("WARN", "Aguarde a gravação terminar")
+            if (!silent) appendLog("WARN", "Aguarde a gravação terminar")
             return
         }
         if (!isConnected) {
-            appendLog("WARN", "Não conectado")
+            if (!silent) appendLog("WARN", "Não conectado")
             return
         }
-        val payload = if (cmd.endsWith("\n")) cmd else "$cmd\n"
-        val bytes = payload.toByteArray(Charsets.UTF_8)
 
         scope.launch(Dispatchers.IO) {
             try {
-                if (mode == ConnectionMode.USB) {
-                    usbPort?.write(bytes, 1000) ?: throw Exception("Porta USB fechada")
+                if (sendAsHexBytes) {
+                    val bytes = parseHexString(cmd)
+                    writeBytes(bytes)
+                    if (!silent) {
+                        val hexFormatted = bytes.joinToString(" ") { "%02X".format(it) }
+                        withContext(Dispatchers.Main) { appendLog("TX [HEX]", hexFormatted) }
+                    }
                 } else {
-                    val out = outputStream ?: throw Exception("Stream fechada")
-                    out.write(bytes)
-                    out.flush()
-                }
-                withContext(Dispatchers.Main) {
-                    appendLog("TX", cmd.trim())
+                    val payload = cmd + lineEnding.suffix
+                    writeRawString(payload, logLabel = if (silent) null else "TX")
                 }
             } catch (e: Exception) {
                 withContext(Dispatchers.Main) {
                     appendLog("ERR", "Falha ao enviar: ${e.message}")
-                    disconnect()
+                    if (e.message?.contains("HEX") != true) disconnect()
                 }
             }
+        }
+    }
+
+    private suspend fun writeRawString(payload: String, logLabel: String?) {
+        val bytes = payload.toByteArray(Charsets.UTF_8)
+        writeBytes(bytes)
+        if (logLabel != null) {
+            withContext(Dispatchers.Main) {
+                appendLog(logLabel, payload.trim())
+            }
+        }
+    }
+
+    private fun writeBytes(bytes: ByteArray) {
+        if (mode == ConnectionMode.USB) {
+            usbPort?.write(bytes, 1000) ?: throw Exception("Porta USB fechada")
+        } else {
+            val out = outputStream ?: throw Exception("Stream fechada")
+            out.write(bytes)
+            out.flush()
+        }
+    }
+
+    private fun parseHexString(input: String): ByteArray {
+        val clean = input.replace("0x", "", ignoreCase = true)
+            .replace(Regex("[^0-9A-Fa-f]"), "")
+        if (clean.isEmpty() || clean.length % 2 != 0) {
+            throw Exception("Sequência HEX inválida (use pares como: 1B 40 0D)")
+        }
+        return ByteArray(clean.length / 2) { i ->
+            clean.substring(i * 2, i * 2 + 2).toInt(16).toByte()
         }
     }
 
@@ -348,14 +496,13 @@ class SerialConnectionManager(
 
                 btSocket = socket
                 outputStream = socket.outputStream
-                val reader = BufferedReader(InputStreamReader(socket.inputStream))
 
                 withContext(Dispatchers.Main) {
                     isConnected = true
                     statusText = "BT: ${device.name}"
                     appendLog("SYS", "Conectado a ${device.name}")
                 }
-                startStreamReader(reader)
+                startInputStreamReader(socket.inputStream)
             } catch (e: Exception) {
                 withContext(Dispatchers.Main) {
                     statusText = "Falha BT"
@@ -376,14 +523,13 @@ class SerialConnectionManager(
 
                 tcpSocket = socket
                 outputStream = socket.getOutputStream()
-                val reader = BufferedReader(InputStreamReader(socket.getInputStream()))
 
                 withContext(Dispatchers.Main) {
                     isConnected = true
                     statusText = "TCP: $ipAddress:$port"
                     appendLog("SYS", "Conectado via Wi-Fi ($ipAddress:$port)")
                 }
-                startStreamReader(reader)
+                startInputStreamReader(socket.getInputStream())
             } catch (e: Exception) {
                 withContext(Dispatchers.Main) {
                     statusText = "Falha TCP"
@@ -394,12 +540,39 @@ class SerialConnectionManager(
         }
     }
 
-    private fun startStreamReader(reader: BufferedReader) {
+    private fun handleIncomingBytes(buffer: ByteArray, len: Int, lineBuilder: StringBuilder) {
+        if (hexViewMode) {
+            val hexStr = (0 until len).joinToString(" ") { "%02X".format(buffer[it]) }
+            scope.launch(Dispatchers.Main) { appendLog("RX [HEX]", hexStr) }
+            return
+        }
+
+        val chunk = String(buffer, 0, len, Charsets.UTF_8)
+        for (ch in chunk) {
+            if (ch == '\n') {
+                val completeLine = lineBuilder.toString().trimEnd('\r')
+                lineBuilder.clear()
+                if (completeLine.isNotEmpty()) {
+                    if (completeLine.startsWith("OK", ignoreCase = true)) {
+                        ackSignal?.complete(true)
+                    }
+                    scope.launch(Dispatchers.Main) { appendLog("RX", completeLine) }
+                }
+            } else {
+                lineBuilder.append(ch)
+            }
+        }
+    }
+
+    private fun startInputStreamReader(input: java.io.InputStream) {
         readerJob = scope.launch(Dispatchers.IO) {
+            val buffer = ByteArray(1024)
+            val lineBuilder = StringBuilder()
             try {
                 while (isActive) {
-                    val line = reader.readLine() ?: break
-                    withContext(Dispatchers.Main) { appendLog("RX", line) }
+                    val len = input.read(buffer)
+                    if (len <= 0) break
+                    handleIncomingBytes(buffer, len, lineBuilder)
                 }
             } catch (e: Exception) {
                 withContext(Dispatchers.Main) {
@@ -420,18 +593,7 @@ class SerialConnectionManager(
                 while (isActive) {
                     val len = port.read(buffer, 200)
                     if (len > 0) {
-                        val chunk = String(buffer, 0, len, Charsets.UTF_8)
-                        for (ch in chunk) {
-                            if (ch == '\n') {
-                                val completeLine = lineBuilder.toString().trimEnd('\r')
-                                lineBuilder.clear()
-                                if (completeLine.isNotEmpty()) {
-                                    withContext(Dispatchers.Main) { appendLog("RX", completeLine) }
-                                }
-                            } else {
-                                lineBuilder.append(ch)
-                            }
-                        }
+                        handleIncomingBytes(buffer, len, lineBuilder)
                     }
                 }
             } catch (e: Exception) {
